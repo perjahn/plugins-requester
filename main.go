@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"sync"
 )
 
 type SuggestedJenkinsPluginsGroup struct {
@@ -64,12 +65,35 @@ func main() {
 		os.Exit(1)
 	}
 
+	type redirectResult struct {
+		index int
+		url   string
+		err   error
+	}
+
+	results := make(chan redirectResult, len(plugins))
+	var wg sync.WaitGroup
+
 	for i, plugin := range plugins {
-		redirectUrl, err := resolveRedirect(plugin.Url)
-		if err != nil {
-			fmt.Printf("Error resolving redirect for %s: %v\n", plugin.Name, err)
-		} else if redirectUrl != plugin.Url {
-			plugins[i].Url = redirectUrl
+		wg.Add(1)
+		go func(index int, pluginURL string, pluginName string) {
+			defer wg.Done()
+			redirectUrl, err := resolveRedirect(pluginURL)
+			if err != nil {
+				fmt.Printf("Error resolving redirect for %s: %v\n", pluginName, err)
+				results <- redirectResult{index, pluginURL, err}
+			} else {
+				results <- redirectResult{index, redirectUrl, nil}
+			}
+		}(i, plugin.Url, plugin.Name)
+	}
+
+	wg.Wait()
+	close(results)
+
+	for result := range results {
+		if result.err == nil && result.url != plugins[result.index].Url {
+			plugins[result.index].Url = result.url
 		}
 	}
 
