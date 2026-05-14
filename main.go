@@ -59,42 +59,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	plugins, err := getJenkinsPluginUrls(append(suggested, additionalplugins...), *includeOptional)
+	plugins, err := getJenkinsPlugins(append(suggested, additionalplugins...), *includeOptional)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
-	}
-
-	type redirectResult struct {
-		index int
-		url   string
-		err   error
-	}
-
-	results := make(chan redirectResult, len(plugins))
-	var wg sync.WaitGroup
-
-	for i, plugin := range plugins {
-		wg.Add(1)
-		go func(index int, pluginURL string, pluginName string) {
-			defer wg.Done()
-			redirectUrl, err := resolveRedirect(pluginURL)
-			if err != nil {
-				fmt.Printf("Error resolving redirect for %s: %v\n", pluginName, err)
-				results <- redirectResult{index, pluginURL, err}
-			} else {
-				results <- redirectResult{index, redirectUrl, nil}
-			}
-		}(i, plugin.Url, plugin.Name)
-	}
-
-	wg.Wait()
-	close(results)
-
-	for result := range results {
-		if result.err == nil && result.url != plugins[result.index].Url {
-			plugins[result.index].Url = result.url
-		}
 	}
 
 	sort.Slice(plugins, func(i, j int) bool {
@@ -148,7 +116,7 @@ func getSuggestedPlugins() ([]string, error) {
 	return suggested, nil
 }
 
-func getJenkinsPluginUrls(pluginids []string, includeOptional bool) ([]Plugin, error) {
+func getJenkinsPlugins(pluginids []string, includeOptional bool) ([]Plugin, error) {
 	client := &http.Client{}
 
 	url := "https://westeurope.cloudflare.jenkins.io/current/update-center.actual.json"
@@ -189,6 +157,8 @@ func getJenkinsPluginUrls(pluginids []string, includeOptional bool) ([]Plugin, e
 		result = append(result, plugin)
 	}
 
+	resolvePluginRedirects(result)
+
 	return result, nil
 }
 
@@ -208,6 +178,40 @@ func getDependencies(allPlugins JenkinsPlugins, pluginId string, plugins map[str
 		Name:    plugin.Name,
 		Url:     plugin.Url,
 		Version: plugin.Version,
+	}
+}
+
+func resolvePluginRedirects(plugins []Plugin) {
+	type redirectResult struct {
+		index int
+		url   string
+		err   error
+	}
+
+	results := make(chan redirectResult, len(plugins))
+	var wg sync.WaitGroup
+
+	for i, plugin := range plugins {
+		wg.Add(1)
+		go func(index int, pluginURL string, pluginName string) {
+			defer wg.Done()
+			redirectUrl, err := resolveRedirect(pluginURL)
+			if err != nil {
+				fmt.Printf("Error resolving redirect for %s: %v\n", pluginName, err)
+				results <- redirectResult{index, pluginURL, err}
+			} else {
+				results <- redirectResult{index, redirectUrl, nil}
+			}
+		}(i, plugin.Url, plugin.Name)
+	}
+
+	wg.Wait()
+	close(results)
+
+	for result := range results {
+		if result.err == nil && result.url != plugins[result.index].Url {
+			plugins[result.index].Url = result.url
+		}
 	}
 }
 
