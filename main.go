@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -45,6 +47,8 @@ type Plugin struct {
 	Name    string
 	Url     string
 	Version string
+	Sha256  string
+	Size    int64
 }
 
 func main() {
@@ -69,17 +73,19 @@ func main() {
 		return plugins[i].Name < plugins[j].Name
 	})
 
+	var totalSize int64
 	for _, plugin := range plugins {
-		fmt.Printf("Name: '%s', Version: '%s', Url: '%s'\n", plugin.Name, plugin.Version, plugin.Url)
+		fmt.Printf("Name: '%s', Version: '%s', Url: '%s', Sha256: '%s', Size: %d\n", plugin.Name, plugin.Version, plugin.Url, plugin.Sha256, plugin.Size)
+		totalSize += plugin.Size
 	}
+
+	fmt.Printf("\nTotal downloaded: %d bytes\n", totalSize)
 }
 
 func getSuggestedPlugins() ([]string, error) {
-	client := &http.Client{}
-
 	url := "https://raw.githubusercontent.com/jenkinsci/jenkins/refs/heads/master/core/src/main/resources/jenkins/install/platform-plugins.json"
 
-	resp, err := client.Get(url)
+	resp, err := http.DefaultClient.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("error downloading list of suggested plugins: %w", err)
 	}
@@ -116,12 +122,10 @@ func getSuggestedPlugins() ([]string, error) {
 	return suggested, nil
 }
 
-func getJenkinsPlugins(pluginids []string, includeOptional bool) ([]Plugin, error) {
-	client := &http.Client{}
-
+func getJenkinsPlugins(pluginNames []string, includeOptional bool) ([]Plugin, error) {
 	url := "https://westeurope.cloudflare.jenkins.io/current/update-center.actual.json"
 
-	resp, err := client.Get(url)
+	resp, err := http.DefaultClient.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("error downloading list of plugins: %w", err)
 	}
@@ -147,7 +151,7 @@ func getJenkinsPlugins(pluginids []string, includeOptional bool) ([]Plugin, erro
 	}
 
 	plugins := make(map[string]Plugin)
-	for _, suggested := range pluginids {
+	for _, suggested := range pluginNames {
 		plugin := jenkinsPlugins.Plugins[suggested]
 		getDependencies(jenkinsPlugins, plugin.Name, plugins, includeOptional)
 	}
@@ -162,30 +166,41 @@ func getJenkinsPlugins(pluginids []string, includeOptional bool) ([]Plugin, erro
 	return result, nil
 }
 
-func getDependencies(allPlugins JenkinsPlugins, pluginId string, plugins map[string]Plugin, includeOptional bool) {
-	if _, exists := plugins[pluginId]; exists {
-		return
-	}
+func getDependencies(allPlugins JenkinsPlugins, pluginName string, plugins map[string]Plugin, includeOptional bool) {
+	stack := []string{pluginName}
 
-	plugin := allPlugins.Plugins[pluginId]
-	for _, dependency := range plugin.Dependencies {
-		if !dependency.Optional || includeOptional {
-			getDependencies(allPlugins, dependency.Name, plugins, includeOptional)
+	for len(stack) > 0 {
+		currentName := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		if _, exists := plugins[currentName]; exists {
+			continue
 		}
-	}
 
-	plugins[pluginId] = Plugin{
-		Name:    plugin.Name,
-		Url:     plugin.Url,
-		Version: plugin.Version,
+		plugin := allPlugins.Plugins[currentName]
+
+		for _, dependency := range plugin.Dependencies {
+			if !dependency.Optional || includeOptional {
+				stack = append(stack, dependency.Name)
+			}
+		}
+
+		plugins[currentName] = Plugin{
+			Name:    plugin.Name,
+			Url:     plugin.Url,
+			Version: plugin.Version,
+			Size:    0,
+		}
 	}
 }
 
 func resolvePluginRedirects(plugins []Plugin) {
 	type redirectResult struct {
-		index int
-		url   string
-		err   error
+		index  int
+		url    string
+		sha256 string
+		size   int64
+		err    error
 	}
 
 	results := make(chan redirectResult, len(plugins))
@@ -195,12 +210,12 @@ func resolvePluginRedirects(plugins []Plugin) {
 		wg.Add(1)
 		go func(index int, pluginURL string, pluginName string) {
 			defer wg.Done()
-			redirectUrl, err := resolveRedirect(pluginURL)
+			finalUrl, sha256sum, size, err := downloadAndChecksum(pluginURL)
 			if err != nil {
-				fmt.Printf("Error resolving redirect for %s: %v\n", pluginName, err)
-				results <- redirectResult{index, pluginURL, err}
+				fmt.Printf("Error downloading %s: %v\n", pluginName, err)
+				results <- redirectResult{index, pluginURL, "", 0, err}
 			} else {
-				results <- redirectResult{index, redirectUrl, nil}
+				results <- redirectResult{index, finalUrl, sha256sum, size, nil}
 			}
 		}(i, plugin.Url, plugin.Name)
 	}
@@ -209,31 +224,46 @@ func resolvePluginRedirects(plugins []Plugin) {
 	close(results)
 
 	for result := range results {
-		if result.err == nil && result.url != plugins[result.index].Url {
+		if result.err == nil {
 			plugins[result.index].Url = result.url
+			plugins[result.index].Sha256 = result.sha256
+			plugins[result.index].Size = result.size
 		}
 	}
 }
 
-func resolveRedirect(url string) (string, error) {
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+func downloadAndChecksum(url string) (string, string, int64, error) {
+	finalUrl := url
+
+	for {
+		resp, err := http.DefaultClient.Head(finalUrl)
+		if err != nil {
+			return finalUrl, "", 0, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusFound {
+			location := resp.Header.Get("Location")
+			if location != "" {
+				finalUrl = location
+				continue
+			}
+		}
+		break
 	}
 
-	resp, err := client.Head(url)
+	resp, err := http.DefaultClient.Get(finalUrl)
 	if err != nil {
-		return url, err
+		return finalUrl, "", 0, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusFound {
-		location := resp.Header.Get("Location")
-		if location != "" {
-			return location, nil
-		}
+	hash := sha256.New()
+	size, err := io.Copy(hash, resp.Body)
+	if err != nil {
+		return finalUrl, "", 0, err
 	}
 
-	return url, nil
+	sha256sum := hex.EncodeToString(hash.Sum(nil))
+	return finalUrl, sha256sum, size, nil
 }
