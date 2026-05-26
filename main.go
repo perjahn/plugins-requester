@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -47,8 +48,8 @@ type Plugin struct {
 	Name    string
 	Url     string
 	Version string
-	Sha256  string
 	Size    int64
+	Sha256  string
 }
 
 func main() {
@@ -56,6 +57,8 @@ func main() {
 	flag.Parse()
 
 	additionalplugins := flag.Args()
+
+	existingVersions := readExistingVersions()
 
 	suggested, err := getSuggestedPlugins()
 	if err != nil {
@@ -69,17 +72,60 @@ func main() {
 		os.Exit(1)
 	}
 
+	var newPlugins []Plugin
+	for _, plugin := range plugins {
+		key := fmt.Sprintf("%s@%s", plugin.Name, plugin.Version)
+		if _, exists := existingVersions[key]; !exists {
+			newPlugins = append(newPlugins, plugin)
+		}
+	}
+	plugins = newPlugins
+
+	if len(plugins) == 0 {
+		fmt.Println("All plugins are already downloaded. Nothing to do.")
+		return
+	}
+
+	downloadPlugins(plugins)
+
 	sort.Slice(plugins, func(i, j int) bool {
 		return plugins[i].Name < plugins[j].Name
 	})
 
+	file, err := os.OpenFile("versions.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		fmt.Printf("Error opening versions.txt: %v\n", err)
+		os.Exit(1)
+	}
+	defer file.Close()
+
 	var totalSize int64
 	for _, plugin := range plugins {
-		fmt.Printf("Name: '%s', Version: '%s', Url: '%s', Sha256: '%s', Size: %d\n", plugin.Name, plugin.Version, plugin.Url, plugin.Sha256, plugin.Size)
+		fmt.Printf("Name: '%s', Version: '%s', Url: '%s', Size: %d, Sha256: '%s'\n", plugin.Name, plugin.Version, plugin.Url, plugin.Size, plugin.Sha256)
 		totalSize += plugin.Size
+		fmt.Fprintf(file, "%s@%s\n", plugin.Name, plugin.Version)
 	}
 
-	fmt.Printf("\nTotal downloaded: %d bytes\n", totalSize)
+	fmt.Printf("\nTotal plugins: %d, Total downloaded: %d bytes\n", len(plugins), totalSize)
+}
+
+func readExistingVersions() map[string]bool {
+	existing := make(map[string]bool)
+
+	data, err := os.ReadFile("versions.txt")
+	if err != nil {
+		return existing
+	}
+
+	lines := strings.SplitSeq(string(data), "\n")
+	for line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			existing[line] = true
+		}
+	}
+
+	return existing
 }
 
 func getSuggestedPlugins() ([]string, error) {
@@ -161,8 +207,6 @@ func getJenkinsPlugins(pluginNames []string, includeOptional bool) ([]Plugin, er
 		result = append(result, plugin)
 	}
 
-	resolvePluginRedirects(result)
-
 	return result, nil
 }
 
@@ -194,28 +238,28 @@ func getDependencies(allPlugins JenkinsPlugins, pluginName string, plugins map[s
 	}
 }
 
-func resolvePluginRedirects(plugins []Plugin) {
-	type redirectResult struct {
+func downloadPlugins(plugins []Plugin) {
+	type downloadResult struct {
 		index  int
 		url    string
-		sha256 string
 		size   int64
+		sha256 string
 		err    error
 	}
 
-	results := make(chan redirectResult, len(plugins))
+	results := make(chan downloadResult, len(plugins))
 	var wg sync.WaitGroup
 
 	for i, plugin := range plugins {
 		wg.Add(1)
-		go func(index int, pluginURL string, pluginName string) {
+		go func(index int, pluginUrl string, pluginName string) {
 			defer wg.Done()
-			finalUrl, sha256sum, size, err := downloadAndChecksum(pluginURL)
+			finalUrl, size, sha256sum, err := downloadAndChecksum(pluginUrl)
 			if err != nil {
 				fmt.Printf("Error downloading %s: %v\n", pluginName, err)
-				results <- redirectResult{index, pluginURL, "", 0, err}
+				results <- downloadResult{index, pluginUrl, 0, "", err}
 			} else {
-				results <- redirectResult{index, finalUrl, sha256sum, size, nil}
+				results <- downloadResult{index, finalUrl, size, sha256sum, nil}
 			}
 		}(i, plugin.Url, plugin.Name)
 	}
@@ -225,45 +269,25 @@ func resolvePluginRedirects(plugins []Plugin) {
 
 	for result := range results {
 		if result.err == nil {
-			plugins[result.index].Url = result.url
 			plugins[result.index].Sha256 = result.sha256
 			plugins[result.index].Size = result.size
 		}
 	}
 }
 
-func downloadAndChecksum(url string) (string, string, int64, error) {
-	finalUrl := url
-
-	for {
-		resp, err := http.DefaultClient.Head(finalUrl)
-		if err != nil {
-			return finalUrl, "", 0, err
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusFound {
-			location := resp.Header.Get("Location")
-			if location != "" {
-				finalUrl = location
-				continue
-			}
-		}
-		break
-	}
-
-	resp, err := http.DefaultClient.Get(finalUrl)
+func downloadAndChecksum(url string) (string, int64, string, error) {
+	resp, err := http.DefaultClient.Get(url)
 	if err != nil {
-		return finalUrl, "", 0, err
+		return url, 0, "", err
 	}
 	defer resp.Body.Close()
 
 	hash := sha256.New()
 	size, err := io.Copy(hash, resp.Body)
 	if err != nil {
-		return finalUrl, "", 0, err
+		return url, 0, "", err
 	}
 
 	sha256sum := hex.EncodeToString(hash.Sum(nil))
-	return finalUrl, sha256sum, size, nil
+	return resp.Request.URL.String(), size, sha256sum, nil
 }
