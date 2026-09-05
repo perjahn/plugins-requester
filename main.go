@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -53,7 +54,7 @@ type Plugin struct {
 }
 
 func main() {
-	includeOptional := flag.Bool("o", false, "include optional dependencies")
+	includeOptional := flag.Bool("o", false, "include optional dependencies.")
 	flag.Parse()
 
 	additionalplugins := flag.Args()
@@ -79,14 +80,19 @@ func main() {
 			newPlugins = append(newPlugins, plugin)
 		}
 	}
-	plugins = newPlugins
-
-	if len(plugins) == 0 {
-		fmt.Println("All plugins are already downloaded. Nothing to do.")
+	if len(newPlugins) == 0 {
+		fmt.Printf("All (%d/%d) plugins are already downloaded. Nothing to do.\n", len(plugins), len(plugins))
 		return
+	} else {
+		fmt.Printf("Downloading %d new plugins (out of %d total plugins)...\n", len(newPlugins), len(plugins))
 	}
 
-	downloadPlugins(plugins)
+	plugins = newPlugins
+
+	if err := downloadPlugins(plugins); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
 
 	sort.Slice(plugins, func(i, j int) bool {
 		return plugins[i].Name < plugins[j].Name
@@ -106,7 +112,7 @@ func main() {
 		fmt.Fprintf(file, "%s@%s\n", plugin.Name, plugin.Version)
 	}
 
-	fmt.Printf("\nTotal plugins: %d, Total downloaded: %d bytes\n", len(plugins), totalSize)
+	fmt.Printf("\nTotal downloaded plugins: %d, Total downloaded: %d bytes\n", len(plugins), totalSize)
 }
 
 func readExistingVersions() map[string]bool {
@@ -238,7 +244,7 @@ func getDependencies(allPlugins JenkinsPlugins, pluginName string, plugins map[s
 	}
 }
 
-func downloadPlugins(plugins []Plugin) {
+func downloadPlugins(plugins []Plugin) error {
 	type downloadResult struct {
 		index  int
 		url    string
@@ -252,27 +258,34 @@ func downloadPlugins(plugins []Plugin) {
 
 	for i, plugin := range plugins {
 		wg.Add(1)
-		go func(index int, pluginUrl string, pluginName string) {
+		go func(index int, pluginUrl string) {
 			defer wg.Done()
 			finalUrl, size, sha256sum, err := downloadAndChecksum(pluginUrl)
 			if err != nil {
-				fmt.Printf("Error downloading %s: %v\n", pluginName, err)
 				results <- downloadResult{index, pluginUrl, 0, "", err}
 			} else {
 				results <- downloadResult{index, finalUrl, size, sha256sum, nil}
 			}
-		}(i, plugin.Url, plugin.Name)
+		}(i, plugin.Url)
 	}
 
 	wg.Wait()
 	close(results)
 
+	var downloadErrors []error
 	for result := range results {
-		if result.err == nil {
-			plugins[result.index].Sha256 = result.sha256
-			plugins[result.index].Size = result.size
+		if result.err != nil {
+			downloadErrors = append(downloadErrors,
+				fmt.Errorf("%s: %w", plugins[result.index].Name, result.err),
+			)
+			continue
 		}
+
+		plugins[result.index].Sha256 = result.sha256
+		plugins[result.index].Size = result.size
 	}
+
+	return errors.Join(downloadErrors...)
 }
 
 func downloadAndChecksum(url string) (string, int64, string, error) {
